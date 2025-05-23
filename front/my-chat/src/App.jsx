@@ -7,6 +7,9 @@ function App() {
   const [userName, setUserName] = useState('') // pour le nom d'utilisateur
   const [isUserNameSet, setIsUserNameSet] = useState(false) // pour savoir si le nom d'utilisateur est défini
   const socketRef = useRef(null) // pour la référence du socket
+  const [rooms, setRooms] = useState([]);
+  const [currentRoom, setCurrentRoom] = useState("general");
+  const [newRoomName, setNewRoomName] = useState("");
 
   // Se connecter au serveur WebSocket au montage du composant
   useEffect(() => {
@@ -23,17 +26,21 @@ function App() {
       setMessages(prevMessages => [...prevMessages, { type: 'system', text: 'Connecté au serveur de chat'}]);
       // Envoyer le nom d'utilisateur au serveur
       socket.send(JSON.stringify({ type: 'join', user: userName }));
+      // Demander la liste des salles
+      socket.send(JSON.stringify({ type: 'get_rooms', user: userName }));
     }
 
     socket.onmessage = (event) => {
-      try {
-        const receivedData = JSON.parse(event.data)
-        console.log('Message du serveur:', receivedData);
-        setMessages(prevMessages => [...prevMessages, receivedData]);
-      } catch (error) {
-        console.log('Message brut du serveur: ', event.data);
-        setMessages(prevMessages => [ ...prevMessages, { type: 'message', user: 'Serveur', text: event.data }])
-        
+      const data = JSON.parse(event.data);
+      console.log('Message reçu:', data);
+      
+      if (data.type === 'room_list') {
+        setRooms(data.rooms);
+      } else if (data.type === 'message' || data.type === 'system') {
+        // Ne pas afficher les messages d'autres salles
+        if (!data.room || data.room === currentRoom) {
+          setMessages(prevMessages => [...prevMessages, data]);
+        }
       }
     }
 
@@ -65,14 +72,14 @@ function App() {
   }, [isUserNameSet, userName]) // se ré-exécute si isUserNameSet ou userName change
 
   const handleSendMessage = () => {
-    if (inputValue.trim() && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      const messageData = {
-        type: 'message', // Type de message
-        user: userName, // Nom de l'utilisateur
-        text: inputValue  // Contenu du message
-      };
-    socketRef.current.send(JSON.stringify(messageData));
-    setInputValue('');  
+    if (inputValue.trim() && socketRef.current) {
+      socketRef.current.send(JSON.stringify({
+        type: 'message',
+        user: userName,
+        room: currentRoom,
+        text: inputValue
+      }));
+      setInputValue('');
     }
   };
 
@@ -92,9 +99,49 @@ function App() {
     )
   }
 
+  const handleJoinRoom = (roomId) => {
+    socket.send(JSON.stringify({
+      type: 'join_room',
+      user: userName,
+      room: roomId
+    }));
+    setCurrentRoom(roomId);
+    setMessages([]); // Vider les messages pour la nouvelle salle
+  }
+
+  const handleCreateRoom = () => {
+    if (newRoomName.trim()) {
+      handleJoinRoom(newRoomName.trim());
+      setNewRoomName("");
+    }
+  }
+
   return (
     <div className='App'>
       <h1>Chat & WebSockets</h1>
+      <div className='room-section'>
+        <h3>Salle actuelle: {currentRoom}</h3>
+        <div className='room-list'>
+          {rooms.map(room => (
+            <button 
+              key={room} 
+              onClick={() => handleJoinRoom(room)}
+              className={room === currentRoom ? 'active' : ''}
+            >
+              {room}
+            </button>
+          ))}
+        </div>
+        <div className='new-room'>
+          <input 
+            type="text"
+            value={newRoomName}
+            onChange={(e) => setNewRoomName(e.target.value)}
+            placeholder="Nom de la nouvelle salle"
+          />
+          <button onClick={handleCreateRoom}>Créer</button>
+        </div>
+      </div>
       <div className='chat-log'>
         {messages.map((msg, index) => (
           <div 
@@ -120,3 +167,4 @@ function App() {
 }
 
 export default App
+
