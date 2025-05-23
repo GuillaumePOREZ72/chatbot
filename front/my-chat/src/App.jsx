@@ -10,6 +10,8 @@ function App() {
   const [rooms, setRooms] = useState([]);
   const [currentRoom, setCurrentRoom] = useState("general");
   const [newRoomName, setNewRoomName] = useState("");
+  // Ajoutez un état pour stocker les messages par salle
+  const [messagesByRoom, setMessagesByRoom] = useState({});
 
   // Se connecter au serveur WebSocket au montage du composant
   useEffect(() => {
@@ -37,7 +39,15 @@ function App() {
       if (data.type === 'room_list') {
         setRooms(data.rooms);
       } else if (data.type === 'message' || data.type === 'system') {
-        // Ne pas afficher les messages d'autres salles
+        const roomId = data.room || 'general';
+        
+        // Stocker le message dans la bonne salle
+        setMessagesByRoom(prev => ({
+          ...prev,
+          [roomId]: [...(prev[roomId] || []), data]
+        }));
+        
+        // Si c'est la salle actuelle, mettre à jour les messages affichés
         if (!data.room || data.room === currentRoom) {
           setMessages(prevMessages => [...prevMessages, data]);
         }
@@ -61,10 +71,10 @@ function App() {
     // Nettoyage: fermer la connexion websocket quand le composant est démonté
     // ou quand isUserNameSet change
     return () => {
-      if (socket) {
+      if (socketRef.current) {
         // Envoi d'un message de "leave" avant de fermer
-        socket.send(JSON.stringify({ type: 'leave', user: userName}))
-        socket.close()
+        socketRef.current.send(JSON.stringify({ type: 'leave', user: userName}))
+        socketRef.current.close()
         console.log('Connexion WebSocket fermée au nettoyage');
         
       }
@@ -73,12 +83,14 @@ function App() {
 
   const handleSendMessage = () => {
     if (inputValue.trim() && socketRef.current) {
-      socketRef.current.send(JSON.stringify({
+      const messageData = {
         type: 'message',
         user: userName,
-        room: currentRoom,
+        room: currentRoom, // Assurez-vous que cette ligne est présente
         text: inputValue
-      }));
+      };
+      console.log('Envoi du message:', messageData); // Ajoutez ce log pour déboguer
+      socketRef.current.send(JSON.stringify(messageData));
       setInputValue('');
     }
   };
@@ -100,17 +112,25 @@ function App() {
   }
 
   const handleJoinRoom = (roomId) => {
-    socket.send(JSON.stringify({
-      type: 'join_room',
-      user: userName,
-      room: roomId
-    }));
-    setCurrentRoom(roomId);
-    setMessages([]); // Vider les messages pour la nouvelle salle
+    if (socketRef.current) {
+      socketRef.current.send(JSON.stringify({
+        type: 'join_room',
+        user: userName,
+        room: roomId
+      }));
+      setCurrentRoom(roomId);
+      
+      // Charger les messages de la salle si disponibles
+      if (messagesByRoom[roomId]) {
+        setMessages(messagesByRoom[roomId]);
+      } else {
+        setMessages([]); // Vider les messages pour la nouvelle salle
+      }
+    }
   }
 
   const handleCreateRoom = () => {
-    if (newRoomName.trim()) {
+    if (newRoomName.trim() && socketRef.current) {
       handleJoinRoom(newRoomName.trim());
       setNewRoomName("");
     }
@@ -167,4 +187,6 @@ function App() {
 }
 
 export default App
+
+
 

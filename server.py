@@ -23,18 +23,31 @@ import websockets
 import json
 import logging
 import motor.motor_asyncio
-import signal
+import platform
+import datetime
 
 
 # Config du logging pour voir ce qui se passe
 logging.basicConfig(level=logging.INFO)
 
 # Connexion à MongoDB
-client = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
+client = motor.motor_asyncio.AsyncIOMotorClient('mongodb+srv://porezguillaumegp:61MYljsKjEZMpAjf@chatsock.anbcpyh.mongodb.net/', serverSelectionTimeoutMS=5000)
 db = client.chat_db  # Base de données
 messages_collection = db.messages  # Collection pour les messages
 users_collection = db.users  # Collection pour les utilisateurs
 rooms_collection = db.rooms  # Collection pour les salons
+
+# Ajoutez cette fonction pour vérifier la connexion
+async def check_mongodb_connection():
+    """Vérifie la connexion à MongoDB"""
+    try:
+        # Ping the database
+        await client.admin.command('ping')
+        logging.info("Connexion à MongoDB établie avec succès")
+        return True
+    except Exception as e:
+        logging.error(f"Impossible de se connecter à MongoDB: {e}")
+        return False
 
 async def get_or_create_user(username):
     """Récupère ou crée un utilisateur dans la base de données"""
@@ -42,20 +55,23 @@ async def get_or_create_user(username):
     if not user:
         user = {
             "username": username,
-            "created_at": asyncio.datetime.datetime.now(),
-            "last_seen": asyncio.datetime.datetime.now()
+            "created_at": datetime.datetime.now(),
+            "last_seen": datetime.datetime.now()
         }
         await users_collection.insert_one(user)
     else:
         # Mettre à jour last_seen
         await users_collection.update_one(
             {"username": username},
-            {"$set": {"last_seen": asyncio.datetime.datetime.now()}}
+            {"$set": {"last_seen": datetime.datetime.now()}}
         )
     return user
 
 # Ensemble pour garder une trace de tous les clients connectés et de leur nom d'utilisateur
 CONNECTED_CLIENTS = {}
+
+# Dictionnaire pour suivre les clients par salle {room_id: {websocket: username}}
+ROOM_CLIENTS = {}
 
 async def register(websocket, username):
     """Enregistre un nouveau client avec son nom d'user et lui envoie l'historique"""
@@ -120,22 +136,15 @@ async def broadcast_message(message_json_string, sender_websocket=None):
         # Sauvegarder le message dans MongoDB
         message_data = json.loads(message_json_string)
         if message_data.get("type") == "message":  # Ne sauvegarder que les messages utilisateur
-            await messages_collection.insert_one({
-                "user": message_data.get("user"),
-                "text": message_data.get("text"),
-                "timestamp": asyncio.datetime.datetime.now()
-            })
-
-async def get_message_history(limit=50):
-    """Récupère les derniers messages de la base de données"""
-    try:
-        cursor = messages_collection.find().sort("timestamp", -1).limit(limit)
-        messages = await cursor.to_list(length=limit)
-        messages.reverse()
-        return messages
-    except Exception as e:
-        logging.error(f"Erreur lors de la récupération de l'historique: {e}")
-        return []
+            try:
+                result = await messages_collection.insert_one({
+                    "user": message_data.get("user"),
+                    "text": message_data.get("text"),
+                    "timestamp": datetime.datetime.now()
+                })
+                logging.info(f"Message global sauvegardé avec ID: {result.inserted_id}")
+            except Exception as e:
+                logging.error(f"Erreur lors de la sauvegarde du message global: {e}")
 
 # Ajouter cette fonction d'aide pour gérer les erreurs MongoDB
 async def safe_db_operation(operation, fallback_value=None):
@@ -153,19 +162,6 @@ async def get_message_history(limit=50):
         fallback_value=[]
     )
 
-async def get_message_history(limit=50):
-    """Récupère les derniers messages de la base de données"""
-    try:
-        cursor = messages_collection.find().sort("timestamp", -1).limit(limit)
-        messages = await cursor.to_list(length=limit)
-        messages.reverse()
-        return messages
-    except Exception as e:
-        logging.error(f"Erreur lors de la récupération de l'historique: {e}")
-        return []
-
-
-
 async def join_room(websocket, username, room_id="general"):
     """Fait rejoindre une salle à un utilisateur"""
     # Vérifier si la salle existe, sinon la créer
@@ -174,29 +170,37 @@ async def join_room(websocket, username, room_id="general"):
         # Vérifier/créer la salle dans MongoDB
         room = await rooms_collection.find_one({"room_id": room_id})
         if not room:
-            await rooms_collection.insert_one({"room_id": room_id, "created_at": asyncio.datetime.datetime.now(), "created_by": username })
-        # Ajouter l'utilisateur à la salle
-        ROOM_CLIENTS[room_id][websocket] = username
-
-        # Notifier les autres utilisateurs de la salle
-        room_message = json.dumps({
-            "type": "system",
-            "room": room_id,
-            "text": f"'{username}' a rejoint la salle '{room_id}'."
-        })
-        await broadcast_to_room(room_message, room_id)
-
-        # Envoyer l'historique des messages de la salle
-        history = await get_room_message_history(room_id)
-        for msg in history:
-            history_message = json.dumps({
-                "type": "message",
-                "room": room_id,
-                "user": msg["user"],
-                "text": msg["text"],
-                "timestamp": msg["timestamp"].isoformat()
+            await rooms_collection.insert_one({
+                "room_id": room_id, 
+                "created_at": datetime.datetime.now(),
+                "created_by": username
             })
-            await websocket.send(history_message)
+    
+    # Ajouter l'utilisateur à la salle
+    ROOM_CLIENTS[room_id][websocket] = username
+
+    # Log pour vérifier que l'utilisateur est bien ajouté à la salle
+    logging.info(f"'{username}' a rejoint la salle '{room_id}'. Clients dans cette salle: {list(ROOM_CLIENTS[room_id].values())}")
+
+    # Notifier les autres utilisateurs de la salle
+    room_message = json.dumps({
+        "type": "system",
+        "room": room_id,
+        "text": f"'{username}' a rejoint la salle '{room_id}'."
+    })
+    await broadcast_to_room(room_message, room_id)
+
+    # Envoyer l'historique des messages de la salle
+    history = await get_room_message_history(room_id)
+    for msg in history:
+        history_message = json.dumps({
+            "type": "message",
+            "room": room_id,
+            "user": msg["user"],
+            "text": msg["text"],
+            "timestamp": msg["timestamp"].isoformat()
+        })
+        await websocket.send(history_message)
 
 
 async def leave_room(websocket, username, room_id):
@@ -218,7 +222,7 @@ async def leave_room(websocket, username, room_id):
             del ROOM_CLIENTS[room_id]
 
 
-async def chat_handler(websocket, path):
+async def chat_handler(websocket):
     """Gère la connexion WebSocket pour un client."""
     # La première action du client devrait être d'envoyer son nom d'utilisateur
     # Pour simplifier, on attend un premier message de type "join"
@@ -255,13 +259,30 @@ async def chat_handler(websocket, path):
                         # Vérifier si le message est destiné à une salle spécifique
                         if data.get("room"):
                             # Message pour une salle spécifique
-                            broadcast_data = {
-                                "type": "message",
-                                "room": data.get("room"),
-                                "user": user,
-                                "text": data["text"]
-                            }
-                            await broadcast_to_room(json.dumps(broadcast_data), data.get("room"))
+                            room_id = data.get("room")
+                            logging.info(f"Message de '{user}' pour la salle '{room_id}': {data.get('text')}")
+                            
+                            # Vérifier si l'utilisateur est bien dans cette salle
+                            if room_id in ROOM_CLIENTS and websocket in ROOM_CLIENTS[room_id]:
+                                broadcast_data = {
+                                    "type": "message",
+                                    "room": room_id,
+                                    "user": user,
+                                    "text": data["text"]
+                                }
+                                await broadcast_to_room(json.dumps(broadcast_data), room_id)
+                            else:
+                                logging.warning(f"L'utilisateur '{user}' n'est pas dans la salle '{room_id}'")
+                                # Rejoindre automatiquement la salle
+                                await join_room(websocket, user, room_id)
+                                # Puis envoyer le message
+                                broadcast_data = {
+                                    "type": "message",
+                                    "room": room_id,
+                                    "user": user,
+                                    "text": data["text"]
+                                }
+                                await broadcast_to_room(json.dumps(broadcast_data), room_id)
                         else:
                             # Message global (pour tous les clients)
                             broadcast_data = {
@@ -285,6 +306,9 @@ async def chat_handler(websocket, path):
                 await websocket.send(json.dumps({"type": "error", "text": "Message mal formaté."}))
             except Exception as e:
                 logging.error(f"Erreur lors du traitement du message de {websocket.remote_address}: {e}")
+                # Ajouter plus de détails sur l'erreur
+                import traceback
+                logging.error(traceback.format_exc())
 
     except websockets.exceptions.ConnectionClosedOK:
         logging.info(f"Connexion fermée proprement par {current_username or websocket.remote_address}")
@@ -298,6 +322,9 @@ async def chat_handler(websocket, path):
 async def broadcast_to_room(message_json_string, room_id="general", sender_websocket=None):
     """Diffuse un message à tous les clients d'une salle et le sauvegarde"""
     if room_id in ROOM_CLIENTS and ROOM_CLIENTS[room_id]:
+        # Ajouter un log pour voir le message exact envoyé
+        logging.info(f"Diffusion dans la salle '{room_id}': {message_json_string}")
+        
         # Envoyer le message à tous les clients de la salle
         tasks = [client.send(message_json_string) for client in ROOM_CLIENTS[room_id]]
         await asyncio.gather(*tasks)
@@ -305,19 +332,29 @@ async def broadcast_to_room(message_json_string, room_id="general", sender_webso
         # Sauvegarder le message dans MongoDB
         message_data = json.loads(message_json_string)
         if message_data.get("type") == "message":
-            await messages_collection.insert_one({
-                "room": room_id,
-                "user": message_data.get("user"),
-                "text": message_data.get("text"),
-                "timestamp": asyncio.datetime.datetime.now()
-            })
+            try:
+                result = await messages_collection.insert_one({
+                    "room": room_id,
+                    "user": message_data.get("user"),
+                    "text": message_data.get("text"),
+                    "timestamp": datetime.datetime.now()
+                })
+                logging.info(f"Message sauvegardé avec ID: {result.inserted_id}")
+            except Exception as e:
+                logging.error(f"Erreur lors de la sauvegarde du message: {e}")
 
 async def get_room_message_history(room_id="general", limit=50):
     """Récupère les derniers messages d'une salle"""
-    cursor = messages_collection.find({"room": room_id}).sort("timestamp", -1).limit(limit)
-    messages = await cursor.to_list(length=limit)
-    messages.reverse()
-    return messages
+    try:
+        cursor = messages_collection.find({"room": room_id}).sort("timestamp", -1).limit(limit)
+        messages = await cursor.to_list(length=limit)
+        messages.reverse()  # Pour avoir les messages dans l'ordre chronologique
+        logging.info(f"Récupération de {len(messages)} messages pour la salle '{room_id}'")
+        return messages
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération des messages pour la salle '{room_id}': {e}")
+        return []
+
 
 async def get_available_rooms():
     """Récupère la liste des salles disponibles"""
@@ -333,17 +370,6 @@ async def send_room_list(websocket):
         "rooms": rooms
     })
     await websocket.send(room_list_message)
-
-async def check_mongodb_connection():
-    """Vérifie la connexion à MongoDB"""
-    try:
-        # Ping the database
-        await client.admin.command('ping')
-        logging.info("Connexion à MongoDB établie avec succès")
-        return True
-    except Exception as e:
-        logging.error(f"Impossible de se connecter à MongoDB: {e}")
-        return False
 
 async def setup_mongodb_indices():
     """Configure les indices MongoDB pour de meilleures performances"""
@@ -365,11 +391,6 @@ async def cleanup():
     logging.info("Connexion MongoDB fermée")
 
 
-def signal_handler():
-    """Gère les signaux d'arrêt"""
-    logging.info("Signal d'arrêt reçu, nettoyage en cours...")
-    asyncio.create_task(cleanup())
-
 async def main():
     host = "localhost"
     port = 8765
@@ -379,17 +400,45 @@ async def main():
         logging.error("Impossible de démarrer le serveur sans connexion MongoDB")
         return
     
+    # Créer explicitement les collections si elles n'existent pas
+    try:
+        await db.create_collection("messages")
+        logging.info("Collection 'messages' créée avec succès")
+    except Exception as e:
+        logging.info(f"Collection 'messages' existe déjà ou erreur: {e}")
+    
+    try:
+        await db.create_collection("users")
+        logging.info("Collection 'users' créée avec succès")
+    except Exception as e:
+        logging.info(f"Collection 'users' existe déjà ou erreur: {e}")
+    
+    try:
+        await db.create_collection("rooms")
+        logging.info("Collection 'rooms' créée avec succès")
+    except Exception as e:
+        logging.info(f"Collection 'rooms' existe déjà ou erreur: {e}")
+    
     # Configurer les indices MongoDB
     await setup_mongodb_indices()
     
-    # Configurer les gestionnaires de signal
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop = asyncio.get_running_loop()
-        loop.add_signal_handler(sig, signal_handler)
+    # Créer la salle "general" par défaut si elle n'existe pas
+    general_room = await rooms_collection.find_one({"room_id": "general"})
+    if not general_room:
+        await rooms_collection.insert_one({
+            "room_id": "general",
+            "created_at": datetime.datetime.now(),
+            "created_by": "system",
+            "description": "Salon général de discussion"
+        })
+        logging.info("Salle 'general' créée avec succès")
     
-    logging.info(f"Serveur WebSocket démarré sur ws://{host}:{port}")
-    async with websockets.serve(chat_handler, host, port, ping_interval=20, ping_timeout=20):
-        await asyncio.Future()  # Maintient le serveur en fonctionnement indéfiniment
+    try:
+        logging.info(f"Serveur WebSocket démarré sur ws://{host}:{port}")
+        async with websockets.serve(chat_handler, host, port, ping_interval=20, ping_timeout=20):
+            await asyncio.Future()  # Maintient le serveur en fonctionnement indéfiniment
+    finally:
+        await cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())

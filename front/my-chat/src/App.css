@@ -115,3 +115,9 @@ body {
 .input-area button:hover {
   background-color: #4cae4c;
 }
+
+.room-list button.active {
+  background-color: #4CAF50;
+  color: white;
+  font-weight: bold;
+}
